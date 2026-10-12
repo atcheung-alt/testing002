@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Next.js build output
+.next/
+out/
+
+# Environment variables — NEVER commit these (contains AUTH_SECRET, Google
+# OAuth secret, database credentials). Only .env.example should be tracked.
+.env
+.env*.local
+.env.production
+.env.development
+
+# Local SQLite artifacts from earlier in development (project now runs on
+# Postgres — see prisma/schema.prisma — but ignore these in case they linger)
+prisma/dev.db
+prisma/dev.db-journal
+*.db
+*.db-journal
+
+# Vercel
+.vercel
+
+# TypeScript / build artifacts
+*.tsbuildinfo
+next-env.d.ts
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS/editor cruft
+.DS_Store
+*.pem
+.idea/
+.vscode/
+.env*

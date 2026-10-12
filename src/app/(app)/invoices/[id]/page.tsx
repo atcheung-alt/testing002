@@ -1,0 +1,328 @@
+import Link from "next/link";
+import { notFound } from "next/navigation";
+import { Pencil, ExternalLink } from "lucide-react";
+import { prisma } from "@/lib/prisma";
+import { formatDate } from "@/lib/calculations";
+import { getInvoiceDisplayStatus, normalizeInvoiceStatus, isOverdueInvoice } from "@/lib/invoiceStatus";
+import StatusBadge from "@/components/StatusBadge";
+import StatusUpdater from "@/components/StatusUpdater";
+import DownloadPdfButton from "@/components/DownloadPdfButton";
+import SendEmailButton from "@/components/SendEmailButton";
+import CopySigningLinkButton from "@/components/CopySigningLinkButton";
+import VerifyPaymentButton from "@/components/VerifyPaymentButton";
+import SyncDriveButton from "@/components/SyncDriveButton";
+import DeleteButton from "@/components/DeleteButton";
+import DuplicateButton from "@/components/DuplicateButton";
+import DocumentItemsTable from "@/components/DocumentItemsTable";
+import BackButton from "@/components/BackButton";
+import ActivityTimeline from "@/components/ActivityTimeline";
+import InvoiceExpensesCard from "@/components/InvoiceExpensesCard";
+import MarkOnCalendarButton from "@/components/MarkOnCalendarButton";
+import { getEventForInvoice } from "@/lib/events";
+import { defaultEmailContent, followUpEmailContent, isValidEmail } from "@/lib/settings";
+import { COMPANY } from "@/lib/company";
+import { ensureInvoiceViewToken, invoiceViewUrlFromHeaders } from "@/lib/signing";
+import { withParsedMultipliersList } from "@/lib/multipliers";
+import { withParsedFeesList } from "@/lib/fees";
+import { getActivityTimeline } from "@/lib/activity";
+
+export const dynamic = "force-dynamic";
+
+export default async function InvoiceDetailPage({ params }: { params: { id: string } }) {
+  const raw = await prisma.invoice.findUnique({
+    where: { id: params.id },
+    include: {
+      items: { orderBy: { sortOrder: "asc" } },
+      expenses: { orderBy: { sortOrder: "asc" } },
+      quotation: { select: { id: true, number: true, driveFileUrl: true } },
+      receipt: { select: { id: true, number: true, issueDate: true, driveFileUrl: true } },
+    },
+  });
+
+  if (!raw) notFound();
+  const invoice = { ...raw, items: withParsedFeesList(withParsedMultipliersList(raw.items)) };
+  const timeline = await getActivityTimeline("invoice", invoice.id);
+  const event = await getEventForInvoice(invoice.id);
+  const expenseCategories = await prisma.expenseCategory.findMany({ orderBy: { sortOrder: "asc" } });
+
+  const locked = invoice.status === "CANCELLED";
+  const token = await ensureInvoiceViewToken(invoice.id);
+  const viewUrl = token ? invoiceViewUrlFromHeaders(token) : null;
+
+  const email = defaultEmailContent({
+    kind: "Invoice",
+    number: invoice.number,
+    title: invoice.title,
+    customerName: invoice.customerName,
+    companyName: COMPANY.shortName || COMPANY.name,
+  });
+
+  // Only worth offering once the invoice has actually gone out and is still
+  // awaiting payment — same gate as "Copy payment link" below, so the two
+  // payment-chasing actions appear/disappear together.
+  const canFollowUp = invoice.status !== "PAID" && invoice.status !== "DRAFT" && !locked;
+  const followUp = followUpEmailContent({
+    number: invoice.number,
+    title: invoice.title,
+    customerName: invoice.customerName,
+    companyName: COMPANY.shortName || COMPANY.name,
+    dueDate: invoice.dueDate,
+    overdue: isOverdueInvoice(invoice),
+  });
+
+  return (
+    <div className="flex flex-col gap-6">
+      <div>
+        <BackButton fallbackHref="/invoices" label="All invoices" />
+        <div className="flex flex-wrap items-start justify-between gap-4 mt-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-3 mb-1">
+              <h1 className="font-display text-2xl font-semibold text-ink">{invoice.number}</h1>
+              <StatusBadge status={getInvoiceDisplayStatus(invoice)} />
+            </div>
+            {invoice.title && (
+              <p className="text-sm font-medium text-ink mb-0.5">{invoice.title}</p>
+            )}
+            <p className="text-sm text-ink-muted">
+              <span className="text-brand-600 font-medium">{invoice.customerName}</span>{" "}
+              · Issued {formatDate(invoice.issueDate)}
+              {invoice.dueDate ? ` · Due ${formatDate(invoice.dueDate)}` : ""}
+              {invoice.poNumber ? ` · PO ${invoice.poNumber}` : ""}
+            </p>
+            {invoice.quotation && (
+              <p className="text-sm text-accent-600 mt-1">
+                Converted from quotation{" "}
+                <Link href={`/quotations/${invoice.quotation.id}`} className="underline">
+                  {invoice.quotation.number}
+                </Link>
+              </p>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <StatusUpdater kind="invoice" id={invoice.id} status={normalizeInvoiceStatus(invoice.status)} />
+            <DownloadPdfButton url={`/api/invoices/${invoice.id}/pdf`} />
+            <SendEmailButton
+              kind="invoices"
+              id={invoice.id}
+              defaultTo={invoice.customerEmail || ""}
+              defaultSubject={email.subject}
+              defaultBody={email.body}
+              emailValid={isValidEmail(invoice.customerEmail)}
+              showCc
+            />
+            {canFollowUp && (
+              <SendEmailButton
+                kind="invoices"
+                id={invoice.id}
+                defaultTo={invoice.customerEmail || ""}
+                defaultSubject={followUp.subject}
+                defaultBody={followUp.body}
+                emailValid={isValidEmail(invoice.customerEmail)}
+                showCc
+                label="Send follow-up email"
+                isFollowUp
+              />
+            )}
+            {viewUrl && invoice.status !== "PAID" && invoice.status !== "DRAFT" && !locked && (
+              <CopySigningLinkButton
+                url={viewUrl}
+                label="Copy payment link"
+                title="Copy the public view & pay link"
+              />
+            )}
+            <Link href={`/invoices/${invoice.id}/edit`} className="btn-secondary">
+              <Pencil size={15} /> Edit
+            </Link>
+            <DuplicateButton kind="invoice" id={invoice.id} />
+            <DeleteButton
+              url={`/api/invoices/${invoice.id}`}
+              confirmNumber={invoice.number}
+              itemLabel="invoice"
+              redirectTo="/invoices"
+            />
+          </div>
+        </div>
+      </div>
+
+      {invoice.status === "PENDING_VERIFICATION" && (
+        <div className="card p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 bg-brand-50/60 border-brand-100">
+          <p className="text-sm text-brand-700">
+            {invoice.paymentSubmittedName || "The client"} marked this invoice as paid
+            {invoice.paymentSubmittedAt ? ` on ${formatDate(invoice.paymentSubmittedAt)}` : ""}
+            {invoice.paymentSubmittedEmail ? ` (${invoice.paymentSubmittedEmail})` : ""}. Verify
+            the funds landed, then confirm below — this generates and emails the receipt
+            automatically.
+          </p>
+          <VerifyPaymentButton invoiceId={invoice.id} />
+        </div>
+      )}
+
+      <div className="card p-5">
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-ink-muted mb-2">
+          Billed to
+        </h2>
+        <p className="font-medium text-sm">{invoice.customerName}</p>
+        {[
+          invoice.customerContact,
+          invoice.customerAddress,
+          invoice.customerEmail,
+          invoice.customerPhone,
+        ]
+          .filter(Boolean)
+          .map((line, i) => (
+            <p key={i} className="text-sm text-ink-muted whitespace-pre-line">
+              {line}
+            </p>
+          ))}
+      </div>
+
+      <div className="card p-5">
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-ink-muted mb-2">Event</h2>
+        {invoice.eventStartDate ? (
+          <div className="flex flex-col gap-3">
+            <p className="text-sm text-ink">
+              {formatDate(invoice.eventStartDate)}
+              {invoice.eventStartTime ? ` at ${invoice.eventStartTime}` : ""}
+              {(invoice.eventEndDate || invoice.eventEndTime) && (
+                <>
+                  {" "}
+                  –{" "}
+                  {invoice.eventEndDate ? formatDate(invoice.eventEndDate) : formatDate(invoice.eventStartDate)}
+                  {invoice.eventEndTime ? ` at ${invoice.eventEndTime}` : ""}
+                </>
+              )}
+            </p>
+            {invoice.eventEndDate ? (
+              <MarkOnCalendarButton invoiceId={invoice.id} markedEventName={event?.name || null} />
+            ) : (
+              <p className="text-sm text-ink-faint">
+                Add an event end date (via Edit) before this can be marked on the calendar.
+              </p>
+            )}
+          </div>
+        ) : (
+          <p className="text-sm text-ink-faint">
+            Not set —{" "}
+            <Link href={`/invoices/${invoice.id}/edit`} className="underline">
+              add one from Edit
+            </Link>
+            .
+          </p>
+        )}
+      </div>
+
+      <DocumentItemsTable
+        items={invoice.items}
+        subtotal={invoice.subtotal}
+        discount={invoice.discount}
+        taxRate={invoice.taxRate}
+        taxAmount={invoice.taxAmount}
+        total={invoice.total}
+      />
+
+      <InvoiceExpensesCard
+        invoiceId={invoice.id}
+        expenses={invoice.expenses}
+        invoiceTotal={invoice.total}
+        categories={expenseCategories.map((c) => c.name)}
+      />
+
+      {invoice.notes && (
+        <div className="card p-5">
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-ink-muted mb-2">
+            Notes
+          </h2>
+          <p className="text-sm text-ink whitespace-pre-line">{invoice.notes}</p>
+        </div>
+      )}
+
+      <div className="card p-5">
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-ink-muted mb-2">
+          Receipt
+        </h2>
+        {invoice.receipt ? (
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm text-ink">
+              {invoice.receipt.number} · issued {formatDate(invoice.receipt.issueDate)}
+            </p>
+            <DownloadPdfButton url={`/api/receipts/${invoice.receipt.id}/pdf`} />
+          </div>
+        ) : (
+          <p className="text-sm text-ink-muted">
+            No receipt yet — one is generated and emailed to the client automatically once this
+            invoice is verified as Paid.
+          </p>
+        )}
+      </div>
+
+      {invoice.receipt && (
+        <div className="card p-5">
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-ink-muted mb-2">
+            Google Drive
+          </h2>
+          <p className="text-sm text-ink-muted mb-2">
+            Kept in sync automatically once a receipt is generated — same folder, always the
+            latest version.
+          </p>
+          {(invoice.quotation?.driveFileUrl || invoice.driveFileUrl || invoice.receipt?.driveFileUrl) && (
+            <div className="flex flex-wrap gap-2 mb-3">
+              {invoice.quotation?.driveFileUrl && (
+                <a
+                  href={invoice.quotation.driveFileUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="btn-secondary"
+                >
+                  <ExternalLink size={15} /> Quotation on Drive
+                </a>
+              )}
+              {invoice.driveFileUrl && (
+                <a
+                  href={invoice.driveFileUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="btn-secondary"
+                >
+                  <ExternalLink size={15} /> Invoice on Drive
+                </a>
+              )}
+              {invoice.receipt?.driveFileUrl && (
+                <a
+                  href={invoice.receipt.driveFileUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="btn-secondary"
+                >
+                  <ExternalLink size={15} /> Receipt on Drive
+                </a>
+              )}
+            </div>
+          )}
+          <SyncDriveButton invoiceId={invoice.id} />
+        </div>
+      )}
+
+      {invoice.signatureData && (
+        <div className="card p-5">
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-ink-muted mb-2">
+            Authorized signature
+          </h2>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={invoice.signatureData}
+            alt="Authorized signature"
+            className="max-h-24 bg-white rounded-lg border border-line"
+          />
+          {invoice.signatureName && (
+            <p className="mt-2 text-sm text-ink">Name: {invoice.signatureName}</p>
+          )}
+          {invoice.signedAt && (
+            <p className="text-xs text-ink-faint">Signed {formatDate(invoice.signedAt)}</p>
+          )}
+        </div>
+      )}
+
+      <ActivityTimeline events={timeline} />
+    </div>
+  );
+}

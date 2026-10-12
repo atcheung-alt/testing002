@@ -1,0 +1,1020 @@
+// Prisma schema for the HR Plus quotation & invoice manager
+//
+// Postgres (Vercel Postgres / Neon). `url` is the pooled (PgBouncer)
+// connection — required for serverless functions, which open far more
+// concurrent connections than a traditional long-running server ever would.
+// `directUrl` bypasses the pooler for schema pushes/migrations, which don't
+// work reliably (or at all) through PgBouncer's transaction-pooling mode.
+datasource db {
+  provider  = "postgresql"
+  url       = env("POSTGRES_PRISMA_URL")
+  directUrl = env("POSTGRES_URL_NON_POOLING")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// A staff login account, authenticated exclusively via Google — see
+// src/lib/googleOAuth.ts. `email` is the verified Google account email
+// that's allowed to sign in; there's no password anywhere in this app.
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String   @default("")
+  // Admin-tier access — currently the one gate in the whole app. Set to
+  // true automatically for the very first account ever created (see the
+  // bootstrap branch in /api/auth/google/callback), false for every account
+  // an admin adds afterwards. Grant it to anyone else by flipping this
+  // column directly (no UI for it yet — deliberately out of scope for now).
+  // Today the only thing this gates is full access to Employee PII
+  // (HKID, address, birthday, salary, bank details) and employee record
+  // create/edit/delete — every other page/API is unaffected.
+  isAdmin   Boolean  @default(false)
+  // Personal color-theme override ("LIGHT" | "DARK" | "AUTO"), independent
+  // of the company-wide default on Setting.themeMode. Null means "no
+  // personal preference set" — the account defers to that company default
+  // (see getEffectiveThemeModeFor in src/lib/appSettings.ts). Deliberately
+  // NOT baked into the signed session cookie (unlike isAdmin above): a
+  // theme change should apply on the very next page load, not wait for the
+  // next sign-in.
+  themeMode String?
+  createdAt DateTime @default(now())
+}
+
+// Single-row table backing the admin Settings page. Always read/written via
+// getSettings()/updateSettings() in src/lib/appSettings.ts, which upserts the
+// one row keyed "singleton" — treat this as a key/value config blob, not a
+// normal per-record model.
+// A recruitment services agreement — entirely separate from the
+// Quotation/Invoice/Receipt (Q-I-R) system used for events/services. Same
+// "signing token + public page" pattern as Quotation, but the document
+// itself is a fixed legal terms template (not an itemized price quote),
+// customized per-client by company name and payment window (days).
+model RecruitmentAgreement {
+  id             String   @id @default(cuid())
+  number         String   @unique // e.g. RA-2026-0001
+  companyName    String   @default("")
+  companyEmail   String   @default("")
+  paymentDueDays Int      @default(14)
+  // The fully rendered terms text (company name + payment days substituted
+  // in), stored as an editable snapshot at creation time — same pattern as
+  // Quotation.terms. Edited live in the form as those two inputs change,
+  // unless staff has directly edited the text themselves.
+  terms          String   @default("")
+  // Clause 13.b's two fee scale tables, editable per-agreement directly on
+  // the New/Edit Agreement page (same idea as paymentDueDays — starts out
+  // pre-filled from the /recruitment/fee-scale library's current defaults,
+  // then belongs entirely to this agreement; editing it here never changes
+  // that shared library, and other agreements are unaffected). JSON-encoded
+  // array of { packageLabel, fee, guaranteePeriod } — see FeeScaleRowFields
+  // in src/lib/recruitmentTerms.ts.
+  feeScalePermanent String @default("[]")
+  feeScaleContract  String @default("[]")
+  // Which language `terms` was generated/edited in — EN | ZH_HANT | ZH_HANS.
+  // See RecruitmentLanguage/RECRUITMENT_TERMS_TEMPLATES in
+  // src/lib/recruitmentTerms.ts. Purely about the clause TEXT; company data
+  // and the fee scale rows above are unaffected by this and stay as entered
+  // regardless of language.
+  language       String   @default("EN")
+  status         String   @default("DRAFT") // DRAFT | SENT | SIGNED | CANCELLED
+
+  // Online signing — mirrors Quotation's signing fields exactly.
+  signingToken      String?   @unique
+  signerName        String?
+  signerCompanyName String?
+  signerJobTitle    String?
+  signatureData     String? // base64 PNG data URL
+  // Alternative to drawing a signature: the client instead downloads the
+  // agreement, signs it on paper, and uploads a scanned/printed PDF back —
+  // mutually exclusive with signatureData (only one of the two is ever set).
+  // Same idea as Quotation.signedDocumentData/signedDocumentName.
+  signedDocumentData String? // base64 PDF data URL
+  signedDocumentName String?
+  signedAt          DateTime?
+  signedIp          String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Setting {
+  id             String   @id @default("singleton")
+
+  // Google Drive folder that generated PDFs are synced into. Overrides the
+  // GOOGLE_DRIVE_ROOT_FOLDER_ID env var when set (see src/lib/appSettings.ts).
+  driveFolderId  String?
+
+  // Company branding shown on PDFs and in outgoing emails. Each overrides
+  // the matching field on the COMPANY constant (src/lib/company.ts) when set.
+  companyName    String?
+  companyLogo    String?  // base64 data URL — "primary": every PDF/email, and the sidebar in light mode
+  companyLogoDark String? // base64 data URL — sidebar only, shown instead of companyLogo when dark mode is active
+  companyWebsite String?
+
+  // Standing CC list applied to every outgoing document/notification email.
+  ccEnabled      Boolean  @default(true)
+  ccEmails       String   @default("") // comma-separated addresses
+
+  // Site-wide UI motion preference (hover/press effects, page transitions,
+  // modal entrances, etc — see the `[data-animations="off"]` kill-switch in
+  // globals.css). A safe default with an obviously-correct value, so unlike
+  // the nullable-by-necessity fields elsewhere in this schema, this one can
+  // be NOT NULL — `db push` backfills every existing row to `true`.
+  animationsEnabled Boolean @default(true)
+
+  // Site-wide color scheme preference: "LIGHT", "DARK", or "AUTO" (follows
+  // the visiting browser's OS-level light/dark preference). Stamped onto
+  // <html data-theme="..."> in the root layout — see getEffectiveThemeMode
+  // in src/lib/appSettings.ts and the CSS variable blocks in globals.css.
+  themeMode      String   @default("LIGHT")
+
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model Quotation {
+  id              String          @id @default(cuid())
+  number          String          @unique
+  title           String          @default("") // e.g. "Wellness Event - Office Massage"
+  customerName    String          @default("")
+  customerContact String?
+  customerEmail   String?
+  customerPhone   String?
+  customerAddress String?
+  issueDate       DateTime        @default(now())
+  expiryDate      DateTime?
+  status          String          @default("DRAFT") // DRAFT, SENT, ACCEPTED, REJECTED, CHANGES_REQUESTED, CONVERTED
+  notes           String?
+  terms           String?
+  reminder        String?
+  paymentDueDays  Int             @default(30)
+  // Which language `terms`/`reminder` were generated/edited in, and which
+  // static labels the PDF renders in — EN | ZH_HANT | ZH_HANS. See
+  // DocumentLanguage/DEFAULT_TERMS_TEMPLATES in src/lib/settings.ts. Same
+  // idea as RecruitmentAgreement.language. Invoice carries its own copy
+  // (see below); Receipt has none of its own and simply inherits its
+  // parent Invoice's language when rendered.
+  language        String          @default("EN")
+  // How many times the whole item list's work is conducted (e.g. a
+  // training run 3 separate times) — the item subtotal is multiplied by
+  // this before Discount/Tax apply (see computeTotals in
+  // src/lib/calculations.ts). 1 means "no repeat", same as any quotation
+  // before this field existed. Quotation-only: Invoice has no equivalent
+  // field since by the time a quotation converts to an invoice, its
+  // subtotal/discount/tax/total already reflect the repeat multiplication
+  // baked in (see convertQuotationToInvoice), so nothing further is needed.
+  repeatCount     Int             @default(1)
+  taxRate         Float           @default(0)
+  discount        Float           @default(0)
+  subtotal        Float           @default(0)
+  taxAmount       Float           @default(0)
+  total           Float           @default(0)
+  items           QuotationItem[]
+  invoice         Invoice?
+  comments        QuotationComment[]
+
+  // Online e-signature workflow
+  signingToken    String?         @unique // random token used in the public /sign/{token} link
+  signatureData   String?         // base64 PNG data URL of the client's drawn signature
+  // Alternative to signatureData: a scanned/printed-and-signed PDF the
+  // client uploaded instead of drawing a signature. Exactly one of
+  // signatureData / signedDocumentData is set for any given signed
+  // quotation, never both, never neither.
+  signedDocumentData String?      // base64 PDF data URL of the uploaded signed document
+  signedDocumentName String?      // original filename of the uploaded document, for display/download
+  signerName      String?         // typed/confirmed name of the person who signed
+  signerEmail     String?         // email address of the person who signed
+  signedAt        DateTime?       // when the signature was captured
+  signedIp        String?         // IP address captured at signing time
+  // When the automatic "you haven't signed yet" follow-up email was sent
+  // (see /api/cron/quotation-followups). Null means none sent yet. Reset to
+  // null whenever staff manually re-sends the quotation email, so a fresh
+  // 7-day window starts from that new send.
+  followUpSentAt  DateTime?
+
+  // Google Drive sync — shared project folder + this quotation's uploaded
+  // PDF, kept in sync (updated in place, never duplicated) whenever a
+  // receipt is generated for the linked invoice.
+  driveFolderId   String?
+  driveFileId     String?
+  driveFileUrl    String?
+
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+}
+
+model QuotationItem {
+  id          String    @id @default(cuid())
+  quotationId String
+  quotation   Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  name        String    @default("")
+  description String    @default("")
+  imageData   String? // base64 data URL of an optional product image
+  unit        String    @default("") // optional unit label, e.g. pcs / hrs / kg
+  quantity    Float     @default(1)
+  // JSON-encoded array of { value: number, label: string } factors that the
+  // user can freely add/remove (e.g. "× 3 persons", "× 2 sessions").
+  // amount = quantity * unitPrice * product(every factor's value).
+  // An empty array ("[]") means no extra factor, i.e. a no-op multiplier of 1.
+  multipliers String    @default("[]")
+  unitPrice   Float     @default(0)
+  amount      Float     @default(0)
+  // Free-text, purely informational (e.g. "3 hours", "half day") — no
+  // calculation implication, shown as its own column beside Qty/Unit
+  // price/Amount. Null/blank means "not set", same convention as `unit`.
+  duration    String?
+  // JSON-encoded array of { label: string, amount: number } named extra
+  // charges tied to this item (e.g. "Transportation fee") — freely
+  // addable/removable like multipliers above. Each fee's amount contributes
+  // to the document's subtotal (see computeTotals in
+  // src/lib/calculations.ts) on top of the base `amount` above; a fee with
+  // no label falls back to "Additional fee" wherever it's displayed. An
+  // empty array ("[]") means no extra charges.
+  fees        String    @default("[]")
+  sortOrder   Int       @default(0)
+}
+
+model Invoice {
+  id              String        @id @default(cuid())
+  number          String        @unique
+  title           String        @default("") // e.g. "Wellness Event - Office Massage"
+  poNumber        String?       // optional client purchase-order number, e.g. "PO4225"
+  customerName    String        @default("")
+  customerContact String?
+  customerEmail   String?
+  customerPhone   String?
+  customerAddress String?
+  quotationId     String?       @unique
+  quotation       Quotation?    @relation(fields: [quotationId], references: [id])
+  issueDate       DateTime      @default(now())
+  dueDate         DateTime?
+  // Event date/time the invoice is for — moved here from Quotation (this
+  // used to live on the quotation itself). Entirely optional and filled in
+  // manually by staff after the invoice already exists — on the create page
+  // for a standalone invoice, or via Edit for one converted from a
+  // quotation (which never carries an event date over automatically). Once
+  // both a start and end date are set, staff can use the "Mark on calendar"
+  // action to create a matching Event row (see the Event model below) —
+  // only Event rows ever appear on the Calendar page, not the invoice itself.
+  eventStartDate  DateTime?
+  eventStartTime  String? // "HH:mm", optional
+  eventEndDate    DateTime?
+  eventEndTime    String? // "HH:mm", optional
+  // Set once staff clicks "Mark on calendar" — see the Event model. Null
+  // means this invoice's event (if any) hasn't been put on the calendar yet.
+  event           Event?
+  status          String        @default("UNPAID") // UNPAID, PENDING_VERIFICATION, PAID, OVERDUE, CANCELLED
+  notes           String?
+  terms           String?
+  reminder        String?
+  paymentDueDays  Int           @default(30)
+  // See Quotation.language for the full explanation. Copied verbatim from
+  // the source quotation when converting (convertQuotationToInvoice) or
+  // set directly when an invoice is created standalone; Receipt has no
+  // column of its own and inherits this at render time.
+  language        String        @default("EN")
+  signatureData   String? // base64 data URL of the invoice e-signature
+  signatureName   String? // typed name accompanying the signature
+  signedAt        DateTime?
+  taxRate         Float         @default(0)
+  discount        Float         @default(0)
+  subtotal        Float         @default(0)
+  taxAmount       Float         @default(0)
+  total           Float         @default(0)
+  items           InvoiceItem[]
+  expenses        InvoiceExpense[]
+
+  // When this invoice actually became PAID (staff-verified) — the basis for
+  // "monthly revenue": revenue and its matching expenses are both bucketed
+  // by this date, not by issueDate, so a paid invoice counts toward the
+  // month money actually landed, not the month it was drafted. Cleared back
+  // to null if a PAID invoice is ever reverted to another status.
+  paidAt          DateTime?
+
+  // Public "view & pay" link, and the client-submitted "Mark as Paid" claim
+  viewToken             String?   @unique // random token used in the public /invoice/{token} link
+  paymentSubmittedAt    DateTime? // when the client clicked "Mark as Paid"
+  paymentSubmittedName  String?   // name the client entered when submitting
+  paymentSubmittedEmail String?   // email the client entered when submitting
+
+  // Google Drive sync — see Quotation.driveFolderId. Invoices without a
+  // linked quotation get their own project folder here instead.
+  driveFolderId   String?
+  driveFileId     String?
+  driveFileUrl    String?
+
+  receipt         Receipt?
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+}
+
+model InvoiceItem {
+  id          String  @id @default(cuid())
+  invoiceId   String
+  invoice     Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  name        String  @default("")
+  description String  @default("")
+  imageData   String? // base64 data URL of an optional product image
+  unit        String  @default("") // optional unit label, e.g. pcs / hrs / kg
+  quantity    Float   @default(1)
+  // JSON-encoded array of { value: number, label: string } factors — see
+  // QuotationItem.multipliers for the full explanation.
+  multipliers String  @default("[]")
+  unitPrice   Float   @default(0)
+  amount      Float   @default(0)
+  // See QuotationItem.duration / .fees for the full explanation — same
+  // fields, same meaning, carried over whenever a quotation converts to
+  // (or is duplicated as) an invoice.
+  duration    String?
+  fees        String  @default("[]")
+  sortOrder   Int     @default(0)
+}
+
+// A single expense staff logs against an invoice/event (e.g. "Venue rental
+// — 450.00"). Purely internal bookkeeping — never shown to the client or on
+// any generated PDF — used to compute this invoice's (and, in aggregate,
+// each month's) net profit.
+model InvoiceExpense {
+  id        String   @id @default(cuid())
+  invoiceId String
+  invoice   Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  // The category name chosen from Settings' managed list, or the literal
+  // "Others" sentinel (always available, never stored in ExpenseCategory).
+  // Stored as a plain denormalized string rather than a foreign key on
+  // purpose — renaming/deleting a category later must never corrupt or
+  // silently re-label historical expenses.
+  category  String   @default("Others")
+  // Free-text detail. Only surfaced in the UI when category is "Others"
+  // (that's the old free-text label field, scoped down to that one case);
+  // ignored for any real category, where the category name is the label.
+  label     String   @default("")
+  amount    Float    @default(0)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+}
+
+// A staff-managed expense category (e.g. "Venue", "Staffing", "Transport"),
+// configured on the Settings page and offered as a dropdown option when
+// logging an invoice expense. "Others" is a built-in option and is never a
+// row in this table.
+model ExpenseCategory {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+}
+
+// A staff-set monthly target, used only for variance analysis on the
+// Analysis page ("actual vs budget"). One row per calendar month. There's
+// no concept of a yearly or per-category budget — deliberately simple.
+model Budget {
+  id             String   @id @default(cuid())
+  year           Int
+  month          Int // 1-12
+  targetRevenue  Float    @default(0)
+  targetExpenses Float    @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([year, month])
+}
+
+// The client library — a reusable address book of customers, separate from
+// the customer fields embedded directly on each Quotation/Invoice (which
+// stay denormalized snapshots, unchanged by edits here, exactly like
+// PresetItem works for line items). Matched primarily by email when
+// detecting "is this a new customer?" on quotation/invoice creation.
+// A client in the library — one record per company/organization (or an
+// individual with no company, which is just a Customer with no ContactPersons
+// beyond themselves — there's no separate "type" anymore). Each client can
+// have any number of named contact people under it.
+// A client in the library — just the company itself (name + address).
+// Contact details live entirely on ContactPerson; a Customer is required to
+// have at least one (enforced in the API, not the schema, same reasoning as
+// other "at least one of..." rules in this app).
+model Customer {
+  id        String          @id @default(cuid())
+  name      String // company/organization name
+  address   String?
+  contacts  ContactPerson[]
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+}
+
+// One named contact person under a Customer — a company can have several
+// (e.g. the person who signs quotations vs. the person who handles
+// invoices). Deleted automatically if the parent Customer is deleted. Both
+// name and email are optional (some contacts are recorded with just a name,
+// or not fully known yet) — when an email is present it's still globally
+// unique (Postgres unique indexes allow any number of NULLs, so multiple
+// contacts without an email don't clash), and it's how "is this a new
+// customer?" detection matches when it's available.
+model ContactPerson {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  name       String?
+  email      String?  @unique
+  createdAt  DateTime @default(now())
+}
+
+// Generated automatically the moment HR Plus verifies a client's payment
+// (invoice status becomes PAID). One receipt per invoice; all display data
+// (customer, line items, amount) is read live from the linked invoice when
+// the receipt PDF is rendered, so this row is mostly a stable number + date.
+model Receipt {
+  id        String   @id @default(cuid())
+  number    String   @unique
+  invoiceId String   @unique
+  invoice   Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  issueDate DateTime @default(now())
+
+  // Google Drive sync — see Quotation.driveFolderId (the receipt lives in
+  // the same shared project folder as its quotation and invoice).
+  driveFileId  String?
+  driveFileUrl String?
+
+  createdAt DateTime @default(now())
+}
+
+// A calendar entry, created explicitly by staff clicking "Mark on calendar"
+// on an invoice once its event start/end date are both set (see
+// Invoice.eventStartDate). Deliberately a separate model from Invoice rather
+// than the calendar just reading Invoice directly — the Calendar page shows
+// ONLY rows here, so a bare invoice with dates filled in doesn't clutter the
+// calendar until staff has actually chosen to put it there, and each event
+// gets its own name distinct from the invoice's own title/customer fields.
+// One event per invoice (invoiceId is unique) — there's currently no "unmark"
+// action, so this is a one-time, one-way action per invoice.
+model Event {
+  id            String   @id @default(cuid())
+  invoiceId     String   @unique
+  invoice       Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  name          String // event name, entered by staff when marking on calendar
+  startDate     DateTime
+  startTime     String? // "HH:mm", optional
+  endDate       DateTime
+  endTime       String? // "HH:mm", optional
+  // Minutes between start and end (date+time combined, defaulting each time
+  // to midnight when not given) — computed once at creation time rather
+  // than recalculated on every read.
+  durationMins  Int
+  // Snapshotted from the invoice at the moment it was marked on the
+  // calendar, same "denormalized copy" convention as Quotation/Invoice's own
+  // embedded customer fields — later edits to the invoice's customer details
+  // don't retroactively change a past event.
+  contactPerson String?
+  companyName   String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([startDate])
+}
+
+// A single message in a quotation's feedback thread — either the client
+// requesting changes / asking a question, or HR Plus staff replying. Shown
+// on both the internal quotation page and the public /sign/{token} page.
+model QuotationComment {
+  id          String    @id @default(cuid())
+  quotationId String
+  quotation   Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  author      String    @default("CLIENT") // "CLIENT" or "STAFF"
+  authorName  String    @default("")
+  message     String
+  createdAt   DateTime  @default(now())
+}
+
+// A single entry in a quotation or invoice's activity timeline (Created,
+// Edited, Viewed by client, Signed, Payment marked, etc). System-generated
+// and append-only — never edited or deleted once written. `documentType` +
+// `documentId` point at the Quotation or Invoice this event belongs to
+// (kept as a loose reference rather than two nullable relations, since an
+// event belongs to exactly one of the two and both models can be deleted
+// independently — that's why there's no onDelete cascade here; deleting a
+// document leaves its history behind rather than silently losing it).
+model ActivityEvent {
+  id           String   @id @default(cuid())
+  documentType String // "quotation" | "invoice"
+  documentId   String
+  type         String // CREATED, EDITED, VIEWED, COMMENT_ADDED, SIGNED, INVOICE_GENERATED, PAYMENT_MARKED, RECEIPT_GENERATED, EMAIL_SENT, DRIVE_UPLOAD
+  // Who performed the action. There's no staff login/accounts in this app,
+  // so STAFF events don't carry an individual name — only CLIENT events
+  // (signing, comments, payment claims) have a real person's name on file.
+  actor        String   @default("STAFF") // "STAFF" | "CLIENT" | "SYSTEM"
+  actorName    String?
+  description  String   @default("")
+  createdAt    DateTime @default(now())
+
+  @@index([documentType, documentId, createdAt])
+}
+
+// A reusable, user-managed library of standardized line items that can be
+// picked from a dropdown when building quotations and invoices.
+model PresetItem {
+  id          String   @id @default(cuid())
+  name        String
+  description String   @default("")
+  imageData   String? // base64 data URL of an optional product image
+  unit        String   @default("")
+  // JSON-encoded array of { value: number, label: string } default factors
+  // applied when this preset is added to a document — see
+  // QuotationItem.multipliers for the full explanation.
+  multipliers String   @default("[]")
+  unitPrice   Float    @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// A user-managed row in one of the two recruitment Terms & Conditions fee
+// tables (Clause 13.b: "Fee Scale for Permanent Placements" / "Fee Scale for
+// Contract Placements"). Rendered into RECRUITMENT_TERMS_TEMPLATE via
+// buildFeeScaleTableText() in src/lib/recruitmentTerms.ts — same
+// placeholder-substitution mechanism as {{clientCompanyName}} /
+// {{paymentDueDays}}, just producing a `| a | b | c |` table block instead
+// of a single value. Managed from /recruitment/fee-scale, mirroring
+// PresetItem's add/edit/delete library pattern (see FeeScaleManager.tsx).
+model RecruitmentFeeScaleRow {
+  id              String   @id @default(cuid())
+  category        String // "PERMANENT" | "CONTRACT"
+  packageLabel    String   @default("")
+  fee             String   @default("")
+  guaranteePeriod String   @default("")
+  sortOrder       Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([category, sortOrder])
+}
+
+// An internal HR employee record — entirely separate from the
+// Quotation/Invoice/Recruitment client-facing documents. Staff fill this in
+// from the Employees section; the employee themselves never logs in, but
+// gets a personal token-based link (mirrors Quotation.signingToken/the
+// public /sign/{token} pattern exactly) to view their leave balance/history
+// and submit new leave requests without needing an account.
+//
+// Every field below except name/title/salary/annualLeaveDays/status is
+// nullable — some (birthday, HKID, bank details) simply may not be on hand
+// the moment a record is first created, and lastDay/leavingReason only ever
+// apply once someone has actually left. There's no "logical requiredness"
+// worth enforcing at the DB level here the way there was for
+// Quotation.eventStartDate; every one of these is just filled in whenever
+// the information becomes available.
+model Employee {
+  id              String   @id @default(cuid())
+  // `name` is kept as an auto-derived, stored column — `${surnameEn}
+  // ${givenNameEn}` — recomputed server-side by employeeFieldsFrom
+  // (src/lib/employees.ts) on every create/update. Every read site in the
+  // app (lists, dropdowns, PDFs, emails, search/sort) keeps using this one
+  // field unchanged; surnameEn/givenNameEn below are the actual source of
+  // truth, split out specifically so official documents like the IR56B tax
+  // form (which has separate Surname/Given Name boxes) can be filled
+  // correctly without guessing how to split a free-text name.
+  name            String   @default("")
+  surnameEn       String   @default("")
+  givenNameEn     String   @default("")
+  // What the employee actually goes by day to day (e.g. a nickname, or just
+  // their given name without the surname) — shown on the Employees list
+  // instead of the full name when set; every other read site (PDFs, emails,
+  // IR56B, etc.) keeps using the full name above unchanged.
+  preferredName   String?
+  title           String   @default("")
+  salary          Float    @default(0)
+  // Annual leave entitlement in days/year. Remaining balance is computed
+  // (entitlement minus days from every APPROVED leave request — see
+  // computeLeaveBalance in src/lib/employees.ts) rather than stored, so it's
+  // always consistent with the request history. Note this is a simple
+  // lifetime running total, not scoped/reset per calendar year.
+  annualLeaveDays Float    @default(0)
+  startDate       DateTime?
+  hkid            String?
+  address         String?
+  gender          String?
+  birthday        DateTime?
+  bankName        String?
+  bankAccount     String?  // account number
+  bankCardName    String?  // account holder name
+  lastDay         DateTime?
+  leavingReason   String?
+  status          String   @default("ACTIVE") // ACTIVE | ONBOARDING | FORMER — see VALID_EMPLOYEE_STATUSES
+  // Full time | Part time | Intern | Freelance — see VALID_EMPLOYMENT_TYPES.
+  // Nullable rather than defaulted, since it wasn't captured for employees
+  // added before this field existed.
+  employmentType  String?
+  // --- Pay structure -------------------------------------------------------
+  // Full time and Intern are paid a flat monthly `salary` above. Part time
+  // and Freelance are paid per unit of work instead — DAILY or HOURLY for
+  // Part time, and DAILY, HOURLY, or a one-off PROJECT_FEE for Freelance
+  // (see VALID_PAY_RATE_TYPES / PAY_RATE_TYPES_BY_EMPLOYMENT_TYPE in
+  // src/lib/employees.ts, which is what actually enforces which
+  // payRateType is valid for which employmentType — this column itself
+  // doesn't constrain it). `payRate` is meaningless (left at its default 0)
+  // whenever `payRateType` is null, i.e. for Full time/Intern/unset, which
+  // use `salary` instead.
+  payRateType     String?
+  payRate         Float    @default(0)
+  // The employee's company (work) email address — distinct from `email`
+  // (the admin-entered address an onboarding invite is sent to) and
+  // `personalEmail` (self-entered on the onboarding form). This is the field
+  // matched against a logged-in User's login email to link that account to
+  // this Employee record for the /hr/profile self-service tab (see
+  // src/lib/myProfile.ts) — so it should be kept in sync with whatever
+  // address the employee actually signs in with.
+  companyEmail    String?
+  // Random token for the public self-service leave link — same mechanism as
+  // Quotation.signingToken, generated on first use via ensureLeaveToken().
+  // A FORMER employee's link stops accepting new requests (still viewable).
+  leaveToken      String?  @unique
+
+  // --- MPF enrollment -------------------------------------------------------
+  // Manually toggled by staff once a new employee's MPF scheme enrollment has
+  // actually been completed with the trustee — this app has no way to verify
+  // that itself. Only meaningful for FULL_TIME employees (see
+  // MPF_DEADLINE_DAYS / mpfDeadlineFor in src/lib/payroll.ts); Part time,
+  // Intern, and Freelance default MPF off entirely so no deadline reminder
+  // applies to them. Null means "not yet verified" — the employee list page
+  // surfaces a reminder once the 60-day statutory enrollment window is
+  // closing/overdue, and hides it as soon as this is set.
+  mpfVerifiedAt   DateTime?
+
+  // --- Onboarding (self-service personal-details form) ---------------------
+  // Admin only enters name + email at first, then sends a public link (same
+  // token mechanism as leaveToken) for the employee to fill in the rest
+  // themselves. `email` is the admin-entered contact address the invite is
+  // sent to; `personalEmail` is what the employee confirms/enters on the
+  // form itself (defaults to `email` if left blank there) and may end up
+  // different (e.g. `email` was a referral address). onboardingCompletedAt
+  // being non-null both marks the form as done AND locks it against further
+  // submissions — see the public submit route.
+  email                        String?
+  onboardingToken              String?   @unique
+  onboardingSentAt             DateTime?
+  onboardingCompletedAt        DateTime?
+  // Same auto-derived pattern as `name` above — `nameChinese` is
+  // `${surnameChinese}${givenNameChinese}` (no space, matching how Chinese
+  // names are conventionally written), recomputed from the split columns.
+  nameChinese                  String?
+  surnameChinese               String?
+  givenNameChinese             String?
+  nationality                  String?
+  phone                        String?
+  personalEmail                String?
+  emergencyContactName         String?
+  emergencyContactRelationship String?
+  emergencyContactPhone        String?
+  bankCode                     String?
+
+  // --- Onboarding documents + declarations ----------------------------------
+  // Uploaded on the same public onboarding form above and pushed straight
+  // into this employee's own Drive folder (see ensureEmployeeDriveFolder /
+  // uploadEmployeeOnboardingDocument in src/lib/driveSync.ts) rather than
+  // stored in Postgres — only the resulting Drive file id/link are kept
+  // here, same "sync in place, cache the pointer" shape as
+  // EmployeeContract.driveFileId. All three are mandatory on submission (see
+  // onboardingSubmissionFieldsFrom), so a non-null pair here means the
+  // employee actually provided that document.
+  addressProofDriveFileId      String?
+  addressProofDriveUrl         String?
+  bankStatementDriveFileId     String?
+  bankStatementDriveUrl        String?
+  hkidDocumentDriveFileId      String?
+  hkidDocumentDriveUrl         String?
+  // The two declaration checkboxes at the bottom of the onboarding form —
+  // both must be true to submit (enforced in onboardingSubmissionFieldsFrom),
+  // so in practice these are only ever false for an employee who hasn't
+  // completed onboarding yet.
+  declarationAccuracy          Boolean  @default(false)
+  declarationConsent           Boolean  @default(false)
+
+  // --- Employment contract (formal PDF letter, sent for e-signature) -------
+  // One contract per employee — created once staff has verified the
+  // onboarding submission and filled in salary/title/leave (see
+  // EmployeeContract below). Its SIGNED -> VERIFIED transition is what
+  // finally flips `status` from ONBOARDING to ACTIVE.
+  contract        EmployeeContract?
+
+  // Google Drive — this employee's own subfolder, nested under one shared
+  // "Employees" folder at the Drive root (see ensureEmployeeDriveFolder in
+  // src/lib/driveSync.ts). Named "{name} - {employment type}" at creation
+  // time and cached here so it's found/reused instantly afterward rather
+  // than re-derived (and possibly renamed) on every sync — same "create
+  // once, reuse forever" behavior as Quotation.driveFolderId. Both the
+  // employee's contract (once verified) and every payslip they're ever
+  // issued upload into this same folder.
+  driveFolderId   String?
+
+  leaveRequests   LeaveRequest[]
+  payrollEntries  PayrollEntry[]
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([status])
+}
+
+// The formal employment contract letter sent to an employee for
+// e-signature during onboarding — same "signing token + public page"
+// pattern as RecruitmentAgreement, plus one extra terminal state
+// (VERIFIED) since a signed contract still needs staff to check it before
+// the employee is marked ACTIVE. One contract per employee (1:1).
+model EmployeeContract {
+  id               String    @id @default(cuid())
+  employeeId       String    @unique
+  employee         Employee  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  // The fully rendered contract letter text, editable the same way
+  // RecruitmentAgreement.terms is (auto-generated from a template until
+  // staff edits it directly).
+  terms            String    @default("")
+  probationPeriod  String?   // free text, e.g. "3 months"
+  contractEndDate  DateTime? // null = permanent / no fixed term
+  workLocation     String?
+  workSchedule     String?   // free text, e.g. "Mon-Fri, 9:30am-6:30pm"
+
+  status           String    @default("DRAFT") // DRAFT | SENT | SIGNED | VERIFIED | CANCELLED
+
+  // Online signing — mirrors RecruitmentAgreement's signing fields.
+  signingToken     String?   @unique
+  signerName       String?
+  signatureData    String?   // base64 PNG data URL
+  // Alternative to drawing a signature: the employee instead downloads the
+  // contract, signs it on paper, and uploads a scanned/printed PDF back —
+  // mutually exclusive with signatureData (only one of the two is ever
+  // set). Same idea as Quotation.signedDocumentData/signedDocumentName.
+  signedDocumentData String?  // base64 PDF data URL
+  signedDocumentName String?
+  signedAt         DateTime?
+  signedIp         String?
+
+  // Staff verification — the one step with no RecruitmentAgreement
+  // equivalent. Set when staff confirms the signed contract, which is also
+  // the moment Employee.status flips ONBOARDING -> ACTIVE.
+  verifiedAt       DateTime?
+
+  // Google Drive — set once the contract is verified (see
+  // syncEmployeeContractToDrive in src/lib/driveSync.ts), which uploads this
+  // contract's PDF into the employee's own Drive folder. driveFileId lets
+  // re-verifying (or any future resync) update that same file in place
+  // instead of creating a duplicate.
+  driveFileId      String?
+  driveFileUrl     String?
+
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+}
+
+// One leave request an employee submitted through their personal
+// /leave/{token} link. Stays PENDING until a staff member approves or
+// rejects it from that employee's record — the annual leave balance only
+// reflects APPROVED requests. `days requested` is computed on read as
+// endDate - startDate + 1 (inclusive) rather than stored — see
+// daysBetweenInclusive in src/lib/employees.ts; this is a simplification
+// that doesn't exclude weekends/public holidays.
+model LeaveRequest {
+  id          String    @id @default(cuid())
+  employeeId  String
+  employee    Employee  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  startDate   DateTime
+  endDate     DateTime
+  // A half-day request is always a single day (startDate == endDate) counted
+  // as 0.5 instead of 1 — see daysBetweenInclusive/computeLeaveUsed in
+  // src/lib/employees.ts. halfDayPeriod records which half of that day
+  // ("AM" | "PM") and is only meaningful when isHalfDay is true.
+  isHalfDay   Boolean   @default(false)
+  halfDayPeriod String?
+  reason      String    @default("")
+  status      String    @default("PENDING") // PENDING | APPROVED | REJECTED
+  submittedIp String?
+  decidedAt   DateTime?
+  // Optional note a staff member can leave when approving/rejecting —
+  // shown back to the employee on their leave link (e.g. a rejection reason).
+  decidedNote String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([employeeId, status])
+}
+
+// A single payroll cycle covering one calendar month (e.g. "2026-08"). Draft
+// runs can be freely edited/regenerated; once staff is happy with the
+// numbers, Finalizing locks every entry against further editing — the same
+// "becomes a historical record" idea as a signed EmployeeContract — so a
+// later change to someone's salary never silently rewrites a past payslip.
+model PayrollRun {
+  id          String         @id @default(cuid())
+  // "YYYY-MM" — a payroll run always covers a whole calendar month, never a
+  // single day, so a plain string key is simpler than a Date here.
+  period      String         @unique
+  status      String         @default("DRAFT") // DRAFT | FINALIZED
+  entries     PayrollEntry[]
+  finalizedAt DateTime?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  @@index([status])
+}
+
+// One employee's calculated pay within a PayrollRun. Employee name/title/
+// employment type/pay basis/rate are snapshotted at the moment the run is
+// created (rather than joined live from Employee) so a later edit to
+// someone's salary, or their leaving the company, never rewrites the
+// historical record of what a past run actually calculated and paid.
+model PayrollEntry {
+  id             String     @id @default(cuid())
+  runId          String
+  run            PayrollRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  employeeId     String
+  employee       Employee   @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  employeeName   String     @default("")
+  employeeTitle  String     @default("")
+  // Snapshot of whichever address a payslip would actually be sent to
+  // (personalEmail || email || companyEmail, same preference order as
+  // buildEmployeeContractPdf) — just a pre-filled default for the "Send"
+  // button below, not authoritative; staff can always type a different
+  // recipient when actually sending.
+  employeeEmail  String?
+  // Snapshot of Employee.employmentType at run-creation time — see
+  // src/lib/employees.ts VALID_EMPLOYMENT_TYPES.
+  employmentType String?
+  // SALARY | DAILY | HOURLY | PROJECT_FEE — SALARY covers the Full time/
+  // Intern flat-monthly-salary case (where Employee.payRateType is actually
+  // null), so it's always set here even though it isn't literally one of
+  // Employee's own payRateType values. See payBasisFor() in
+  // src/lib/payroll.ts, the single source of truth for this mapping.
+  payBasis       String     @default("SALARY")
+  // The salary, or the day/hour/project rate, whichever applies — editable
+  // per entry (e.g. a one-off adjustment) without touching the employee's
+  // own record.
+  rate           Float      @default(0)
+  // Only meaningful for DAILY/HOURLY (days or hours actually worked this
+  // period, filled in by staff before finalizing); always 1 for
+  // PROJECT_FEE and unused for SALARY.
+  unitsWorked    Float      @default(0)
+
+  grossPay       Float      @default(0)
+  // One-off bonus amount added on top of gross pay before MPF/net pay —
+  // only ever set/editable for Full time employees (see the FULL_TIME
+  // check in the entry PATCH route and the "Bonus" column in
+  // PayrollRunEntries.tsx); always 0 for every other employment type.
+  // Deliberately NOT included in the MPF calculation base (computeMpf in
+  // src/lib/payroll.ts still runs off grossPay alone) — HK MPF is assessed
+  // on "relevant income" from regular wages, and treating a discretionary
+  // bonus as ordinary wages for MPF purposes is a call HR Plus should make
+  // deliberately per bonus, not one this app should bake in silently.
+  bonus          Float      @default(0)
+  // Whether Mandatory Provident Fund applies to this entry — defaults per
+  // employment type (see defaultMpfApplicable in src/lib/payroll.ts) but
+  // editable per entry, since MPF eligibility ultimately depends on
+  // specifics (age, contract type) this app doesn't otherwise track.
+  mpfApplicable  Boolean    @default(true)
+  employeeMpf    Float      @default(0)
+  employerMpf    Float      @default(0)
+  netPay         Float      @default(0)
+
+  notes          String?
+  // Set the first time this entry's payslip is emailed — shown in the run
+  // detail table so staff can see at a glance who's still owed a payslip.
+  payslipSentAt  DateTime?
+
+  // Google Drive — set once the run is finalized (see syncPayrollRunToDrive
+  // in src/lib/driveSync.ts), which uploads this entry's payslip PDF into
+  // the employee's own Drive folder (same folder the verified contract
+  // lives in). driveFileId lets a future resync update that same file in
+  // place instead of creating a duplicate.
+  driveFileId    String?
+  driveFileUrl   String?
+
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  @@unique([runId, employeeId])
+  @@index([employeeId])
+}
+
+// The event-based booking system (Resource System → Bookings) — replaces
+// the old single-resource, fixed-9am-9pm massage calendar. Staff create a
+// BookingEvent for whatever's being offered (a massage day, a DIY workshop
+// that runs over several days, etc.), then add one or more BookingSlot rows
+// under it — each slot is its own specific day + start time + custom
+// duration (freely chosen per slot, e.g. via a duration slider in the admin
+// UI, not the old fixed 60-minute grid) + a booking quota (how many separate
+// client bookings that one slot can hold). A multi-day event's slots are
+// configured day by day rather than from one repeating daily template, so
+// e.g. a workshop's Saturday and Sunday sessions can differ. The public
+// booking page is per-event (`/book/[eventId]`) rather than one generic
+// form, since each event's available days/times/quota are entirely its own.
+//
+// `date`/`startTime` stay separate fields (calendar day + "HH:MM" string)
+// rather than one combined DateTime — same convention the old Booking model
+// used and Quotation.eventStartDate/eventStartTime still use — sidestepping
+// timezone ambiguity around bare wall-clock times, since the app assumes a
+// single (Hong Kong) local timezone throughout rather than converting.
+//
+// All three models are read/written via raw SQL ($queryRaw/$executeRaw) in
+// src/lib/bookings.ts rather than the generated `prisma.*` delegates — see
+// that file's header comment for why (same reasoning as the Event model).
+model BookingEvent {
+  id          String   @id @default(cuid())
+  name        String
+  description String   @default("")
+  // Which company this event is being run for — mandatory. Every booking
+  // made against this event belongs to this same company, so clients are no
+  // longer asked to type their own company on the public form (see
+  // Booking below, which no longer carries a clientCompany field at all).
+  companyName String
+  // The first and last calendar day this event can have slots on — the
+  // public page's date picker and the admin's per-day slot builder are both
+  // bounded to this range. Equal for a single-day event.
+  startDate   DateTime
+  endDate     DateTime
+  // Hidden from the public listing/booking pages once false, without
+  // deleting its (possibly still-referenced) slots and booking history.
+  active      Boolean  @default(true)
+  // When true, a new booking against this event starts PENDING instead of
+  // immediately CONFIRMED (see createBooking) — staff have to review and
+  // confirm it from the internal /bookings/[id] page before the client's
+  // real confirmation email goes out. Deliberately a staff-only setting:
+  // read from the request body only on the requireAdminApi-gated PATCH/POST
+  // in /api/bookings/events — the public manage-link route always writes
+  // back the event's existing value untouched, so whoever holds a shared
+  // manage link can't turn this off for themselves and skip review.
+  requiresConfirmation Boolean @default(false)
+  // Powers this event's own public "manage bookings" link (see
+  // manageBookingEventUrlFor in src/lib/signing.ts and
+  // src/app/manage-booking/[token]/page.tsx) — no login, just this random
+  // token, scoped to this one event only. Whoever has the link can edit this
+  // event's own details/slots and cancel or delete its bookings, but can't
+  // hide/show or delete the event itself — those stay staff-only (see
+  // requireAdminApi-gated /api/bookings/events/[id]). A plain column like
+  // Booking.cancelToken rather than a separate token table, since an event
+  // only ever needs the one manage link. Nullable (unlike cancelToken)
+  // because this shipped after events already existed: new events get one
+  // generated immediately (see createBookingEvent), while an older event
+  // only gets one lazily, the first time staff copies its manage link (see
+  // ensureBookingEventManageToken) — the same lazy-backfill pattern as
+  // ensureSigningToken/ensureLeaveToken/etc. above for their own tokens.
+  manageToken String?  @unique
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  slots BookingSlot[]
+
+  @@index([active, startDate])
+}
+
+// One specific bookable window on one specific day of a BookingEvent —
+// staff set its duration (freeform minutes, chosen via a slider in the
+// admin UI rather than a fixed grid) and quota (how many separate client
+// bookings it can hold) independently per slot.
+model BookingSlot {
+  id           String       @id @default(cuid())
+  eventId      String
+  event        BookingEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  date         DateTime
+  startTime    String
+  durationMins Int
+  // Max concurrent bookings this slot accepts — one booking always counts
+  // as exactly one spot (no per-booking party size).
+  quota        Int          @default(1)
+  createdAt    DateTime     @default(now())
+
+  bookings Booking[]
+
+  @@index([eventId, date])
+}
+
+// A client's booking against one specific BookingSlot — no login, a
+// straightforward public form (see src/app/book/[id]/page.tsx). Every
+// booking is accepted immediately (status starts at CONFIRMED, not a
+// PENDING request awaiting staff review) — PENDING/REJECTED remain valid
+// values only for whatever historical rows predate this change; nothing
+// creates them anymore. `cancelToken` powers the client's own "cancel my
+// booking" link, emailed to them at booking time (see
+// src/app/booking-cancel/[token]/page.tsx) — unlike every other public link
+// in this app it isn't a separate token table, just a random column on the
+// row itself, since a booking only ever needs the one self-service action.
+model Booking {
+  id            String      @id @default(cuid())
+  slotId        String
+  slot          BookingSlot @relation(fields: [slotId], references: [id], onDelete: Cascade)
+  clientName    String
+  // At least one of phone/email is required (enforced in
+  // bookingFieldsFrom, not at the schema level) — staff need some way to
+  // reach the client.
+  clientPhone   String?
+  clientEmail   String?
+  notes         String      @default("")
+  status        String      @default("CONFIRMED") // CONFIRMED | CANCELLED | PENDING (legacy) | REJECTED (legacy)
+  submittedIp   String?
+  decidedAt     DateTime?
+  // Optional note left when cancelling (staff- or client-initiated) — same
+  // idea as LeaveRequest.decidedNote above.
+  decidedNote   String?
+  cancelToken   String      @unique
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@index([slotId, status])
+}
